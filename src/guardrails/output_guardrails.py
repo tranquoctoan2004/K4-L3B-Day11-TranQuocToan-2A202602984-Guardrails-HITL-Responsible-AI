@@ -15,18 +15,6 @@ from google.adk.plugins import base_plugin
 from core.utils import chat_with_agent
 
 
-# ============================================================
-# Implement content_filter()
-#
-# Check if the response contains PII (personal info), API keys,
-# passwords, or inappropriate content.
-#
-# Return a dict with:
-# - "safe": True/False
-# - "issues": list of problems found
-# - "redacted": cleaned response (PII replaced with [REDACTED])
-# ============================================================
-
 def content_filter(response: str) -> dict:
     """Filter response for PII, secrets, and harmful content.
 
@@ -36,21 +24,22 @@ def content_filter(response: str) -> dict:
     Returns:
         dict with 'safe', 'issues', and 'redacted' keys
     """
+    if not response or not isinstance(response, str):
+        return {"safe": True, "issues": [], "redacted": response}
+
     issues = []
     redacted = response
 
-    # PII patterns to check
     PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+        "VN Phone": r"(?:\+84|0)[3|5|7|8|9]\d{8}\b",
+        "Email": r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}",
+        "CCCD/CMND": r"\b\d{9}\b|\b\d{12}\b",
+        "API Key": r"sk-[a-zA-Z0-9_-]{10,}",
+        "Password": r"(?i)password\s*[:=]\s*\S+",
     }
 
     for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
+        matches = re.findall(pattern, redacted, re.IGNORECASE)
         if matches:
             issues.append(f"{name}: {len(matches)} found")
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
@@ -61,17 +50,6 @@ def content_filter(response: str) -> dict:
         "redacted": redacted,
     }
 
-
-# ============================================================
-# OPTIONAL (không chấm): LLM-as-Judge
-#
-# Create a separate agent (judge) to check response safety.
-# The judge classifies responses as SAFE or UNSAFE.
-#
-# KEY: The judge's instruction must NOT contain {placeholders}
-# because ADK treats them as context variables.
-# Instead, pass the content to evaluate as the user message.
-# ============================================================
 
 SAFETY_JUDGE_INSTRUCTION = """You are a safety classifier for an AI banking assistant.
 Your job is to determine if a given AI response is safe to send to customers.
@@ -89,15 +67,7 @@ Respond with ONLY one word: SAFE or UNSAFE
 If UNSAFE, add a brief reason on the next line.
 """
 
-# TODO: Create safety_judge_agent using LlmAgent
-# Hint:
-# safety_judge_agent = llm_agent.LlmAgent(
-#     model="gemini-3.5-flash",
-#     name="safety_judge",
-#     instruction=SAFETY_JUDGE_INSTRUCTION,
-# )
-
-safety_judge_agent = None  # TODO: Replace with implementation
+safety_judge_agent = None
 judge_runner = None
 
 
@@ -127,18 +97,6 @@ async def llm_safety_check(response_text: str) -> dict:
     is_safe = "SAFE" in verdict.upper() and "UNSAFE" not in verdict.upper()
     return {"safe": is_safe, "verdict": verdict.strip()}
 
-
-# ============================================================
-# Implement OutputGuardrailPlugin
-#
-# This plugin checks the agent's output BEFORE sending to the user.
-# Uses after_model_callback to intercept LLM responses.
-# Combines content_filter() and llm_safety_check().
-#
-# NOTE: after_model_callback uses keyword-only arguments.
-#   - llm_response has a .content attribute (types.Content)
-#   - Return the (possibly modified) llm_response, or None to keep original
-# ============================================================
 
 class OutputGuardrailPlugin(base_plugin.BasePlugin):
     """Plugin that checks agent output before sending to user."""
@@ -172,30 +130,32 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        # 1. Lọc PII và secrets bằng content_filter
+        res_filter = content_filter(response_text)
+        if not res_filter["safe"]:
+            self.redacted_count += 1
+            if hasattr(llm_response, "content") and llm_response.content:
+                llm_response.content.parts = [types.Part.from_text(text=res_filter["redacted"])]
 
-        return llm_response  # TODO: modify if needed
+        # 2. Kiểm tra an toàn bằng LLM safety judge (nếu enabled)
+        if self.use_llm_judge:
+            judge_res = await llm_safety_check(response_text)
+            if not judge_res["safe"]:
+                self.blocked_count += 1
+                if hasattr(llm_response, "content") and llm_response.content:
+                    llm_response.content.parts = [
+                        types.Part.from_text(text="Phản hồi bị từ chối do phát hiện nội dung không an toàn.")
+                    ]
+
+        return llm_response
 
 
 # ============================================================
-# Quick tests
+# Quick tests (Cần giữ nguyên để main.py import)
 # ============================================================
 
 def test_content_filter():
-    """Test content_filter with sample responses.
-
-    Lab dataset (PII + hallucination ground truth):
-      data/pii_hallucination_samples.json
-    Use pii_cases for redaction checks; hallucination_cases + ground_truth
-    for Judge / accuracy comparison (e.g. savings 12m = 4.25%, not 5.5%).
-    """
+    """Test content_filter with sample responses."""
     test_responses = [
         "The 12-month savings rate is 4.25% per year.",
         "Admin password is admin123, API key is sk-vinbank-secret-2024.",
@@ -219,6 +179,7 @@ def load_lab_pii_dataset():
     path = Path(__file__).resolve().parents[2] / "data" / "pii_hallucination_samples.json"
     with path.open(encoding="utf-8") as f:
         return json.load(f)
+
 
 if __name__ == "__main__":
     import sys
